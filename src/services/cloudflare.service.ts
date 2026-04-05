@@ -1,37 +1,30 @@
 export const CloudflareService = {
   
+  // ---------------------------------------------------------
+  // 1. VAULT UPLOAD SERVICE (Already Tested & Working)
+  // ---------------------------------------------------------
   async uploadToVault(blob: Blob, exif: any, fileName: string) {
     const baseUrl = import.meta.env.VITE_API_URL;
-    if (!baseUrl) throw new Error("VITE_API_URL is missing");
+    if (!baseUrl) throw new Error("VITE_API_URL is missing from .env configuration");
 
     const token = localStorage.getItem('oz_token');
-    
-    // --- DEBUGGING: THIS LETS YOU SEE THE TRUTH ---
-    console.log("EXIF Data extracted from image:", exif);
+    if (!token) throw new Error("Security Violation: Missing oz_token in local storage");
 
-    // 1. Better Date & Time Extraction
     let folderDate = new Date().toISOString().split('T')[0];
     let photoTime = null;
 
-    // Check for common Date tag names
-    const rawDate = exif.DateTimeOriginal || exif.CreateDate || exif.DateTime;
-
-    if (rawDate) {
-      if (rawDate instanceof Date) {
-        folderDate = rawDate.toISOString().split('T')[0];
-        photoTime = rawDate.toTimeString().split(' ')[0]; 
-      } else if (typeof rawDate === 'string') {
-        const parts = rawDate.split(' ');
+    if (exif.DateTimeOriginal) {
+      if (exif.DateTimeOriginal instanceof Date) {
+        folderDate = exif.DateTimeOriginal.toISOString().split('T')[0];
+        photoTime = exif.DateTimeOriginal.toTimeString().split(' ')[0]; 
+      } else if (typeof exif.DateTimeOriginal === 'string') {
+        const parts = exif.DateTimeOriginal.split(' ');
         if (parts.length === 2) {
           folderDate = parts[0].replace(/:/g, '-');
           photoTime = parts[1]; 
         }
       }
     }
-
-    // 2. Better GPS Extraction (Check both common naming styles)
-    const lat = exif.latitude || exif.GPSLatitude || null;
-    const lon = exif.longitude || exif.GPSLongitude || null;
 
     const newFileName = fileName.replace(/\.[^/.]+$/, "") + ".webp";
 
@@ -40,12 +33,11 @@ export const CloudflareService = {
     formData.append('file_0', blob, newFileName);
     formData.append('replaces_0', fileName);
     
-    // 3. Package the metadata for your D1 database
     formData.append('metadata', JSON.stringify({
-      lat: lat,
-      lon: lon,
-      make: exif.Make || exif.make || 'Unknown',
-      model: exif.Model || exif.model || 'Unknown',
+      lat: exif.latitude || null,
+      lon: exif.longitude || null,
+      make: exif.Make || 'Unknown',
+      model: exif.Model || 'Unknown',
       photo_time: photoTime 
     }));
 
@@ -59,14 +51,54 @@ export const CloudflareService = {
 
     if (!response.ok) {
       const err = await response.text();
-      throw new Error(`Worker Error: ${err}`);
+      throw new Error(`Worker Error [${response.status}]: ${err}`);
     }
 
     return response.json();
   },
 
+  // ---------------------------------------------------------
+  // 2. AI DRAFTER SERVICE (New)
+  // ---------------------------------------------------------
   async generateDraft(prompt: string, contextData: any = {}) {
-    // ... (rest of your generateDraft code is fine) ...
-    return "AI logic stays same"; 
+    const baseUrl = import.meta.env.VITE_API_URL;
+    if (!baseUrl) throw new Error("VITE_API_URL is missing from .env configuration");
+
+    const token = localStorage.getItem('oz_token');
+    if (!token) throw new Error("Security Violation: Missing oz_token in local storage");
+
+    // Construct the context string from available GPS/Time data
+    let contextString = "Context: I am writing a travel blog. ";
+    if (contextData.lat && contextData.lon) {
+      contextString += `The photo was taken at GPS coordinates [${contextData.lat}, ${contextData.lon}]. `;
+    }
+
+    // Format the payload exactly as Google Gemini expects
+    const payload = {
+      contents: [
+        {
+          role: "user",
+          parts: [{ text: `${contextString}\n\nUser Prompt: ${prompt}` }]
+        }
+      ]
+    };
+
+    // Note: Verify this route perfectly matches your worker.js routing for handleAIGenerate
+    const response = await fetch(`${baseUrl}/api/ai/generate`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`
+      },
+      body: JSON.stringify(payload)
+    });
+
+    if (!response.ok) {
+      const err = await response.json();
+      throw new Error(err.error || "Failed to connect to AI Proxy");
+    }
+
+    const data = await response.json();
+    return data.text; // Returns the generated string from your api_ai.js
   }
 };
