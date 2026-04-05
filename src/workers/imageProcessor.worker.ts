@@ -9,21 +9,35 @@ self.onmessage = async (e: MessageEvent) => {
       lat: null as number | null,
       lon: null as number | null,
       time: null as string | null,
+      date: null as string | null, // <--- Added this line
       make: null as string | null,
       model: null as string | null,
     };
     try {
       const parsed = await exifr.parse(file);
       if (parsed) {
+        // 1. Extract GPS
         if (parsed.latitude && parsed.longitude) {
           exifData.lat = parsed.latitude;
           exifData.lon = parsed.longitude;
         }
+        
+        // 2. Extract Date AND Time
         if (parsed.DateTimeOriginal) {
           const d = new Date(parsed.DateTimeOriginal);
-          if (!isNaN(d.getTime()))
+          if (!isNaN(d.getTime())) {
+            // Keep the time exactly as you had it
             exifData.time = d.toTimeString().split(' ')[0];
+            
+            // Extract and save the date properly (Local time YYYY-MM-DD)
+            const year = d.getFullYear();
+            const month = String(d.getMonth() + 1).padStart(2, '0');
+            const day = String(d.getDate()).padStart(2, '0');
+            exifData.date = `${year}-${month}-${day}`;
+          }
         }
+        
+        // 3. Extract Camera Make & Model
         if (parsed.Make) exifData.make = parsed.Make;
         if (parsed.Model) exifData.model = parsed.Model;
       }
