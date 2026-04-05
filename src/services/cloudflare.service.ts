@@ -1,7 +1,7 @@
 export const CloudflareService = {
   
   // ---------------------------------------------------------
-  // 1. VAULT UPLOAD SERVICE (Already Tested & Working)
+  // 1. VAULT UPLOAD SERVICE (Corrected for EXIF and D1 Schema)
   // ---------------------------------------------------------
   async uploadToVault(blob: Blob, exif: any, fileName: string) {
     const baseUrl = import.meta.env.VITE_API_URL;
@@ -10,9 +10,13 @@ export const CloudflareService = {
     const token = localStorage.getItem('oz_token');
     if (!token) throw new Error("Security Violation: Missing oz_token in local storage");
 
+    // 1. Determine Folder Date and Photo Time
     let folderDate = new Date().toISOString().split('T')[0];
-    let photoTime = null;
+    
+    // Grab the time directly from the worker log output ('time')
+    let photoTime = exif.time || null; 
 
+    // Keep your original DateTimeOriginal logic just in case other cameras use it
     if (exif.DateTimeOriginal) {
       if (exif.DateTimeOriginal instanceof Date) {
         folderDate = exif.DateTimeOriginal.toISOString().split('T')[0];
@@ -24,21 +28,26 @@ export const CloudflareService = {
           photoTime = parts[1]; 
         }
       }
+    } else if (exif.date) {
+        folderDate = exif.date; // Fallback if worker passes a simple 'date' string
     }
 
     const newFileName = fileName.replace(/\.[^/.]+$/, "") + ".webp";
 
     const formData = new FormData();
-    formData.append('date', folderDate);
+    formData.append('date', folderDate); // Used for R2 storage folders
     formData.append('file_0', blob, newFileName);
     formData.append('replaces_0', fileName);
     
+    // 2. Package the Metadata EXACTLY matching your D1 Schema columns
+    // We use the exact keys from your console logs (exif.lat, exif.lon, etc.)
     formData.append('metadata', JSON.stringify({
-      lat: exif.latitude || null,
-      lon: exif.longitude || null,
-      make: exif.Make || 'Unknown',
-      model: exif.Model || 'Unknown',
-      photo_time: photoTime 
+      lat: exif.lat || null,
+      lon: exif.lon || null,
+      camera_make: exif.make || 'Unknown',   // Matches D1: camera_make
+      camera_model: exif.model || 'Unknown', // Matches D1: camera_model
+      photo_time: photoTime,                 // Matches D1: photo_time
+      folder_date: folderDate                // Matches D1: folder_date
     }));
 
     const response = await fetch(`${baseUrl}/api/vault/upload`, {
