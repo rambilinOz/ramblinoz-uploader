@@ -194,7 +194,7 @@ export const VaultDashboard: React.FC = () => {
           marginBottom: '20px',
         }}
       >
-        <h2>RamblinOz Bulk Ingestion Portal</h2>
+        <h2>RamblinOz Portal</h2>
         <div>
           {isProcessing ? (
             <button
