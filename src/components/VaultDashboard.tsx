@@ -1,31 +1,28 @@
+// VaultDashboard.tsx
 import React, { useState, useRef } from 'react';
 import ImageWorker from '../workers/imageProcessor.worker?worker';
 import { CloudflareService } from '../services/cloudflare.service';
-
-// Added 'cancelled' to the status options
-interface QueuedFile {
-  id: string;
-  file: File;
-  status:
-    | 'pending'
-    | 'processing'
-    | 'success'
-    | 'skipped'
-    | 'error'
-    | 'cancelled';
-  message?: string;
-}
 
 export const VaultDashboard: React.FC = () => {
   // ---------------------------------------------------------
   // STATE MANAGEMENT
   // ---------------------------------------------------------
-  const [queue, setQueue] = useState<QueuedFile[]>([]);
+  const [queue, setQueue] = useState<File[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [completed, setCompleted] = useState(false);
   const [dragActive, setDragActive] = useState(false);
+  
+  // New UI Progress State
+  const [progress, setProgress] = useState({
+    percent: 0,
+    activeFileName: '',
+    activeFileSize: '',
+    statusText: ''
+  });
+  const [failedFiles, setFailedFiles] = useState<string[]>([]);
 
   const workerRef = useRef<Worker | null>(null);
-  const cancelRef = useRef<boolean>(false); // Tracks if the user clicked Cancel
+  const cancelRef = useRef<boolean>(false); 
 
   // ---------------------------------------------------------
   // DRAG AND DROP HANDLERS
@@ -54,28 +51,27 @@ export const VaultDashboard: React.FC = () => {
 
   const addFilesToQueue = (files: File[]) => {
     const imageFiles = files.filter((file) => file.type.startsWith('image/'));
-    const newQueueItems: QueuedFile[] = imageFiles.map((file) => ({
-      id: crypto.randomUUID(),
-      file,
-      status: 'pending',
-    }));
-    setQueue((prev) => [...prev, ...newQueueItems]);
+    setQueue((prev) => [...prev, ...imageFiles]);
+    setCompleted(false);
+    setFailedFiles([]);
+    setProgress({ percent: 0, activeFileName: '', activeFileSize: '', statusText: '' });
   };
 
   const clearQueue = () => {
     if (isProcessing) return;
     setQueue([]);
+    setFailedFiles([]);
+    setCompleted(false);
   };
 
   // ---------------------------------------------------------
-  // CORE PROCESSING ENGINE
+  // CORE PROCESSING ENGINE (The Chunking Architecture)
   // ---------------------------------------------------------
   const processSingleFile = (file: File): Promise<any> => {
     return new Promise((resolve) => {
       if (!workerRef.current) workerRef.current = new ImageWorker();
       workerRef.current.onmessage = (e: MessageEvent) => resolve(e.data);
-      workerRef.current.onerror = (err) =>
-        resolve({ success: false, error: err.message });
+      workerRef.current.onerror = (err) => resolve({ success: false, error: err.message });
       workerRef.current.postMessage(file);
     });
   };
@@ -83,178 +79,107 @@ export const VaultDashboard: React.FC = () => {
   const startBatchProcess = async () => {
     if (queue.length === 0 || isProcessing) return;
     setIsProcessing(true);
-    cancelRef.current = false; // Reset cancel flag before starting
+    cancelRef.current = false; 
 
-    for (let i = 0; i < queue.length; i++) {
-      // 1. Check if user clicked Cancel
-      if (cancelRef.current) {
-        setQueue((prev) =>
-          prev.map((item) =>
-            item.status === 'pending'
-              ? { ...item, status: 'cancelled', message: 'Cancelled by user' }
-              : item
-          )
-        );
-        break; // Stop the loop entirely
+    let currentBatch: any[] = [];
+    let localFailed: string[] = [];
+
+    // Helper function to safely transmit chunks to the Edge
+    const sendBatch = async () => {
+      if (currentBatch.length === 0) return;
+      setProgress(prev => ({ ...prev, statusText: `Transmitting batch of ${currentBatch.length} images to Cloudflare...` }));
+      
+      try {
+        const resp = await CloudflareService.uploadBatchToVault(currentBatch);
+        if (resp.skipped && resp.skipped.length > 0) {
+          localFailed.push(...resp.skipped.map((s: string) => `${s} (Duplicate in D1)`));
+        }
+      } catch (e: any) {
+        localFailed.push(...currentBatch.map(f => `${f.originalName} (Network Error)`));
       }
+      currentBatch = []; // Purge batch from RAM
+    };
 
-      const currentItem = queue[i];
-      if (currentItem.status !== 'pending') continue;
+    // Sequential Extraction Loop
+    for (let i = 0; i < queue.length; i++) {
+      if (cancelRef.current) break;
 
-      setQueue((prev) =>
-        prev.map((item) =>
-          item.id === currentItem.id ? { ...item, status: 'processing' } : item
-        )
-      );
+      const file = queue[i];
+      const percent = Math.round((i / queue.length) * 100);
+
+      // 1. Update Single-Line UI
+      setProgress({
+        percent,
+        activeFileName: file.name,
+        activeFileSize: (file.size / 1024 / 1024).toFixed(2) + ' MB',
+        statusText: 'Extracting EXIF & Optimizing WebP...'
+      });
 
       try {
-        const workerResult = await processSingleFile(currentItem.file);
-        if (!workerResult.success)
-          throw new Error(workerResult.error || 'Worker failed');
-
-        const dbResponse = await CloudflareService.uploadToVault(
-          workerResult.blob,
-          workerResult.exif,
-          workerResult.originalName
-        );
-
-        if (
-          dbResponse.skipped &&
-          dbResponse.skipped.includes(workerResult.originalName)
-        ) {
-          setQueue((prev) =>
-            prev.map((item) =>
-              item.id === currentItem.id
-                ? {
-                    ...item,
-                    status: 'skipped',
-                    message: 'Duplicate found in D1',
-                  }
-                : item
-            )
-          );
-        } else {
-          setQueue((prev) =>
-            prev.map((item) =>
-              item.id === currentItem.id
-                ? { ...item, status: 'success', message: 'Saved to Vault' }
-                : item
-            )
-          );
+        // 2. Process locally via RAM
+        const result = await processSingleFile(file);
+        if (!result.success) {
+          localFailed.push(`${file.name} (Worker Failed)`);
+          continue;
         }
-      } catch (error: any) {
-        setQueue((prev) =>
-          prev.map((item) =>
-            item.id === currentItem.id
-              ? { ...item, status: 'error', message: error.message }
-              : item
-          )
-        );
+
+        const fileDate = result.exif.date || new Date().toISOString().split('T')[0];
+
+        // 3. Batch Boundaries: 20 Items OR Date Change
+        if (currentBatch.length >= 20 || (currentBatch.length > 0 && currentBatch[0].date !== fileDate)) {
+          await sendBatch();
+        }
+
+        currentBatch.push({ ...result, date: fileDate });
+      } catch(e) {
+        localFailed.push(`${file.name} (Processing Error)`);
       }
     }
 
+    // Wrap up remainder
+    if (!cancelRef.current) {
+      await sendBatch();
+      setProgress({ percent: 100, activeFileName: '', activeFileSize: '', statusText: 'Upload Complete!' });
+      setCompleted(true);
+    } else {
+      setProgress(prev => ({ ...prev, statusText: 'Cancelled by User.' }));
+    }
+
+    setFailedFiles(localFailed);
     setIsProcessing(false);
   };
 
-  const cancelUpload = () => {
-    cancelRef.current = true;
-  };
+  const cancelUpload = () => { cancelRef.current = true; };
 
   const handleCloseModal = () => {
-    // This sends the signal up to the Vanilla JS Main Dashboard
     if (window.parent) {
       window.parent.postMessage({ action: 'RAMBLINOZ_UPLOAD_COMPLETE' }, '*');
-    } else {
-      console.log('No parent window found to send close signal to.');
     }
   };
 
   // ---------------------------------------------------------
   // UI RENDERING
   // ---------------------------------------------------------
-  const pendingCount = queue.filter((q) => q.status === 'pending').length;
-  const successCount = queue.filter((q) => q.status === 'success').length;
-  const skippedCount = queue.filter((q) => q.status === 'skipped').length;
-
   return (
-    <div
-      style={{
-        width: '100%',
-        padding: '20px 30px',
-        boxSizing: 'border-box',
-        fontFamily: 'system-ui',
-        color: '#333',
-      }}
-    >
-      <div
-        style={{
-          display: 'flex',
-          justifyContent: 'space-between',
-          alignItems: 'center',
-          marginBottom: '20px',
-        }}
-      >
-        <h2>RamblinOz Portal</h2>
+    <div style={{ width: '100%', padding: '20px 30px', boxSizing: 'border-box', fontFamily: 'system-ui', color: '#333' }}>
+      
+      {/* HEADER */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
+        <h2>RamblinOz Vault Portal</h2>
         <div>
           {isProcessing ? (
-            <button
-              onClick={cancelUpload}
-              style={{
-                padding: '8px 16px',
-                background: '#dc3545',
-                color: 'white',
-                border: 'none',
-                borderRadius: '4px',
-                cursor: 'pointer',
-                fontWeight: 'bold',
-              }}
-            >
+            <button onClick={cancelUpload} style={{ padding: '8px 16px', background: '#dc3545', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}>
               Stop / Cancel
             </button>
           ) : (
             <>
-              <button
-                onClick={clearQueue}
-                disabled={queue.length === 0}
-                style={{
-                  padding: '8px 16px',
-                  marginRight: '10px',
-                  background: '#f1f1f1',
-                  border: '1px solid #ccc',
-                  borderRadius: '4px',
-                  cursor: queue.length === 0 ? 'not-allowed' : 'pointer',
-                }}
-              >
-                Clear Queue
+              <button onClick={clearQueue} disabled={queue.length === 0} style={{ padding: '8px 16px', marginRight: '10px', background: '#f1f1f1', border: '1px solid #ccc', borderRadius: '4px', cursor: queue.length === 0 ? 'not-allowed' : 'pointer' }}>
+                Clear
               </button>
-              <button
-                onClick={startBatchProcess}
-                disabled={pendingCount === 0}
-                style={{
-                  padding: '8px 16px',
-                  marginRight: '10px',
-                  background: pendingCount === 0 ? '#ccc' : '#007BFF',
-                  color: 'white',
-                  border: 'none',
-                  borderRadius: '4px',
-                  cursor: pendingCount === 0 ? 'not-allowed' : 'pointer',
-                  fontWeight: 'bold',
-                }}
-              >
-                Start Upload ({pendingCount})
+              <button onClick={startBatchProcess} disabled={queue.length === 0 || completed} style={{ padding: '8px 16px', marginRight: '10px', background: (queue.length === 0 || completed) ? '#ccc' : '#007BFF', color: 'white', border: 'none', borderRadius: '4px', cursor: (queue.length === 0 || completed) ? 'not-allowed' : 'pointer', fontWeight: 'bold' }}>
+                Start Upload
               </button>
-              <button
-                onClick={handleCloseModal}
-                style={{
-                  padding: '8px 16px',
-                  background: '#28a745',
-                  color: 'white',
-                  border: 'none',
-                  borderRadius: '4px',
-                  cursor: 'pointer',
-                  fontWeight: 'bold',
-                }}
-              >
+              <button onClick={handleCloseModal} style={{ padding: '8px 16px', background: '#28a745', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}>
                 Done / Close
               </button>
             </>
@@ -262,164 +187,72 @@ export const VaultDashboard: React.FC = () => {
         </div>
       </div>
 
-      {/* DRAG AND DROP ZONE */}
-      <div
-        onDragEnter={handleDrag}
-        onDragLeave={handleDrag}
-        onDragOver={handleDrag}
-        onDrop={handleDrop}
-        style={{
-          border: `2px dashed ${dragActive ? '#007BFF' : '#ccc'}`,
-          backgroundColor: dragActive ? '#f0f8ff' : '#fafafa',
-          padding: '40px',
-          textAlign: 'center',
-          borderRadius: '8px',
-          marginBottom: '20px',
-          transition: 'all 0.2s ease',
-          opacity: isProcessing ? 0.5 : 1,
-          pointerEvents: isProcessing ? 'none' : 'auto',
-        }}
-      >
-        <p style={{ fontSize: '18px', margin: '0 0 10px 0' }}>
-          Drag & Drop months of photos here
-        </p>
-        <input
-          type="file"
-          multiple
-          accept="image/*"
-          onChange={handleFileSelect}
-          style={{ display: 'none' }}
-          id="file-upload"
-          disabled={isProcessing}
-        />
-        <label
-          htmlFor="file-upload"
-          style={{
-            background: '#333',
-            color: '#fff',
-            padding: '8px 16px',
-            borderRadius: '4px',
-            cursor: 'pointer',
-          }}
-        >
-          Or Browse Files
-        </label>
-      </div>
+      {/* CONDITIONAL UI: EITHER PROCESSING/COMPLETE SCREEN OR DRAG/DROP ZONE */}
+      {(isProcessing || completed) ? (
+        
+        /* THE NEW PROGRESS UI */
+        <div style={{ background: '#fff', padding: '30px', borderRadius: '8px', border: '1px solid #ddd', textAlign: 'center' }}>
+          {completed ? (
+            <div>
+               <h3 style={{color: '#28a745', fontSize: '24px', marginBottom: '10px'}}>✅ Transmission Complete</h3>
+               <p style={{color: '#666'}}>All eligible files have been synced to the D1 Database and R2 Storage.</p>
+               
+               {failedFiles.length > 0 && (
+                 <div style={{textAlign: 'left', marginTop: '25px', background: '#fff3f3', padding: '15px', borderRadius: '6px', borderLeft: '4px solid #dc3545'}}>
+                     <h4 style={{margin: '0 0 10px 0', color: '#dc3545'}}>⚠️ Skipped / Protected Files ({failedFiles.length})</h4>
+                     <ul style={{margin: 0, paddingLeft: '20px', fontSize: '14px', color: '#666', maxHeight: '150px', overflowY: 'auto'}}>
+                         {failedFiles.map((f, i) => <li key={i}>{f}</li>)}
+                     </ul>
+                 </div>
+               )}
+            </div>
+          ) : (
+            <div style={{maxWidth: '500px', margin: '0 auto'}}>
+                <div style={{display: 'flex', justifyContent: 'space-between', marginBottom: '8px', fontSize: '14px'}}>
+                  <strong style={{color: '#007BFF'}}>{progress.statusText}</strong>
+                  <span style={{color: '#666'}}>{progress.percent}%</span>
+                </div>
+                
+                {/* Visual Progress Bar */}
+                <div style={{ background: '#e9ecef', height: '20px', borderRadius: '10px', overflow: 'hidden', marginBottom: '15px' }}>
+                    <div style={{ width: `${progress.percent}%`, background: '#007BFF', height: '100%', transition: 'width 0.3s ease' }} />
+                </div>
+                
+                {/* Single Line Detail Text */}
+                {progress.activeFileName && (
+                  <div style={{fontSize: '13px', color: '#666', background: '#f8f9fa', padding: '8px', borderRadius: '4px', fontFamily: 'monospace'}}>
+                    Processing: <strong>{progress.activeFileName}</strong> ({progress.activeFileSize})
+                  </div>
+                )}
+            </div>
+          )}
+        </div>
+      ) : (
 
-      {/* STATS ROW */}
-      {queue.length > 0 && (
+        /* ORIGINAL DRAG AND DROP ZONE */
         <div
+          onDragEnter={handleDrag} onDragLeave={handleDrag} onDragOver={handleDrag} onDrop={handleDrop}
           style={{
-            display: 'flex',
-            gap: '20px',
-            marginBottom: '15px',
-            fontSize: '14px',
-            padding: '10px',
-            background: '#eef2f5',
-            borderRadius: '6px',
+            border: `2px dashed ${dragActive ? '#007BFF' : '#ccc'}`,
+            backgroundColor: dragActive ? '#f0f8ff' : '#fafafa',
+            padding: '40px', textAlign: 'center', borderRadius: '8px',
+            transition: 'all 0.2s ease'
           }}
         >
-          <strong>Queue: {queue.length}</strong>
-          <span style={{ color: 'blue' }}>Pending: {pendingCount}</span>
-          <span style={{ color: 'green' }}>Success: {successCount}</span>
-          <span style={{ color: 'orange' }}>Skipped: {skippedCount}</span>
+          <p style={{ fontSize: '18px', margin: '0 0 10px 0' }}>Drag & Drop months of photos here</p>
+          <input type="file" multiple accept="image/*" onChange={handleFileSelect} style={{ display: 'none' }} id="file-upload" />
+          <label htmlFor="file-upload" style={{ background: '#333', color: '#fff', padding: '8px 16px', borderRadius: '4px', cursor: 'pointer' }}>
+            Or Browse Files
+          </label>
+
+          {queue.length > 0 && (
+            <div style={{marginTop: '20px', color: '#007BFF', fontWeight: 'bold'}}>
+               📥 {queue.length} images staged and ready for transmission.
+            </div>
+          )}
         </div>
       )}
 
-      {/* LIST VIEW OF PROCESSING FILES */}
-      {queue.length > 0 && (
-        <div
-          style={{
-            border: '1px solid #eee',
-            borderRadius: '8px',
-            maxHeight: '500px',
-            overflowY: 'auto',
-          }}
-        >
-          <table
-            style={{
-              width: '100%',
-              borderCollapse: 'collapse',
-              fontSize: '14px',
-            }}
-          >
-            <thead
-              style={{ background: '#f9f9f9', position: 'sticky', top: 0 }}
-            >
-              <tr>
-                <th
-                  style={{
-                    padding: '10px',
-                    textAlign: 'left',
-                    borderBottom: '1px solid #ddd',
-                  }}
-                >
-                  File Name
-                </th>
-                <th
-                  style={{
-                    padding: '10px',
-                    textAlign: 'left',
-                    borderBottom: '1px solid #ddd',
-                  }}
-                >
-                  Size
-                </th>
-                <th
-                  style={{
-                    padding: '10px',
-                    textAlign: 'left',
-                    borderBottom: '1px solid #ddd',
-                  }}
-                >
-                  Status
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              {queue.map((item) => (
-                <tr
-                  key={item.id}
-                  style={{
-                    borderBottom: '1px solid #eee',
-                    background:
-                      item.status === 'error' ? '#ffeeee' : 'transparent',
-                  }}
-                >
-                  <td style={{ padding: '10px', fontFamily: 'monospace' }}>
-                    {item.file.name}
-                  </td>
-                  <td style={{ padding: '10px', color: '#666' }}>
-                    {(item.file.size / 1024 / 1024).toFixed(2)} MB
-                  </td>
-                  <td style={{ padding: '10px' }}>
-                    {item.status === 'pending' && (
-                      <span style={{ color: '#999' }}>⏳ Waiting</span>
-                    )}
-                    {item.status === 'processing' && (
-                      <span style={{ color: '#007BFF', fontWeight: 'bold' }}>
-                        ⚙️ Processing...
-                      </span>
-                    )}
-                    {item.status === 'success' && (
-                      <span style={{ color: 'green' }}>✅ {item.message}</span>
-                    )}
-                    {item.status === 'skipped' && (
-                      <span style={{ color: 'orange' }}>⚠️ {item.message}</span>
-                    )}
-                    {item.status === 'error' && (
-                      <span style={{ color: 'red' }}>❌ {item.message}</span>
-                    )}
-                    {item.status === 'cancelled' && (
-                      <span style={{ color: '#666' }}>🛑 {item.message}</span>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
     </div>
   );
 };
