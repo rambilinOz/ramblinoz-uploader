@@ -78,7 +78,7 @@ export const ImageVault: React.FC = () => {
     <div
       style={{
         padding: '20px',
-        maxWidth: '600px',
+        maxWidth: '100%',
         margin: '0 auto',
         fontFamily: 'system-ui',
       }}
